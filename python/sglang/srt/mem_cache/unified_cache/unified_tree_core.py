@@ -419,10 +419,40 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            component_types_enabled=params.enable_kv_cache_event_component_types,
         )
 
         self.reset()
+
+    @property
+    def _swa_kv_events_enabled(self) -> bool:
+        """SWA placement events are only meaningful when SWA KV is
+        content-stable. The device-only HiCache layout keeps SWA as a
+        per-request ring (never cached/backed up), so suppress events there.
+        """
+        if ComponentType.SWA not in self.components_by_type:
+            return False
+        return self.has_swa_host_pool or not self.enable_hicache
+
+    def _record_component_store_if_present(
+        self, node, medium: StorageMedium, component_type: ComponentType
+    ) -> None:
+        """Emit a component store event when the component has a materialized
+        value on the given medium; SWA events obey the content-stability gate.
+        """
+        if component_type.is_swa and not self._swa_kv_events_enabled:
+            return
+        component_data = node.component_data[component_type]
+        materialized = (
+            component_data.host_value
+            if medium == StorageMedium.CPU
+            else component_data.value
+        )
+        if materialized is None:
+            return
+        self.kv_events.record_store(node, medium=medium, component_type=component_type)
 
     # ==== Tree API ====
 
@@ -1142,7 +1172,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node)
+        self.kv_events.record_store(new_node, component_type=BASE_COMPONENT_TYPE)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1161,7 +1191,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(node, medium=StorageMedium.GPU)
+        self.kv_events.record_store(
+            node, medium=StorageMedium.GPU, component_type=ct
+        )
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -1326,7 +1358,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         """Free every component layer on the node and detach it from the LRU
         lists and evictable leaf sets."""
-        self.kv_events.record_remove(node, medium=medium)
+        if self.kv_events.component_types_enabled:
+            for comp in self.components:
+                if comp.component_type.is_swa and not self._swa_kv_events_enabled:
+                    continue
+                self.kv_events.record_remove(
+                    node, medium=medium, component_type=comp.component_type
+                )
+        else:
+            self.kv_events.record_remove(node, medium=medium)
         for comp in self.components:
             self._evict_component_and_detach_lru(
                 node,
@@ -1445,7 +1485,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Free only the Full host layer; aux host slices stay under their own
         pools' LRU (a host-only aux slice may be a sole copy)."""
         assert self._can_reclaim_full_host_duplicate(node)
-        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
+        self.kv_events.record_remove(
+            node, medium=StorageMedium.CPU, component_type=BASE_COMPONENT_TYPE
+        )
         self._evict_component_and_detach_lru(
             node,
             self.components_by_type[BASE_COMPONENT_TYPE],
@@ -1470,7 +1512,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
-        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
+        if self.kv_events.component_types_enabled:
+            for comp in self.components:
+                if comp.component_type.is_swa and not self._swa_kv_events_enabled:
+                    continue
+                self.kv_events.record_remove(
+                    node, medium=StorageMedium.CPU, component_type=comp.component_type
+                )
+        else:
+            self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         for comp in self.components:
             _, hf = self._evict_component_and_detach_lru(
                 node,
@@ -1506,6 +1556,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         assert not node.evicted and node.backuped
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
+        if self.kv_events.component_types_enabled:
+            freed_device_components = [
+                comp.component_type
+                for comp in self.components
+                if node.component_data[comp.component_type].value is not None
+                and not (
+                    comp.component_type.is_swa and not self._swa_kv_events_enabled
+                )
+            ]
+        else:
+            freed_device_components = None
         self._evict_component_and_detach_lru(
             node,
             trigger,
@@ -1517,7 +1578,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._cascade_evict(
             node, trigger, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self.kv_events.record_remove(node, medium=StorageMedium.GPU)
+        if freed_device_components is None:
+            self.kv_events.record_remove(node, medium=StorageMedium.GPU)
+        else:
+            for component_type in freed_device_components:
+                self.kv_events.record_remove(
+                    node, medium=StorageMedium.GPU, component_type=component_type
+                )
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -2003,7 +2070,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cache_actions=cache_actions,
         )
         for nid in kv_xfer.nodes_to_load or ():
-            self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
+            self.kv_events.record_store(
+                self.node_by_id(nid),
+                medium=StorageMedium.GPU,
+                component_type=BASE_COMPONENT_TYPE,
+            )
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -2011,6 +2082,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 xfers,
                 cache_actions=cache_actions,
             )
+            for xfer in xfers:
+                for nid in xfer.nodes_to_load or ():
+                    self._record_component_store_if_present(
+                        self.node_by_id(nid), StorageMedium.GPU, ct
+                    )
         self._update_evictable_leaf_sets(node)
         return cache_actions
 
@@ -2046,7 +2122,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
-            self.kv_events.record_store(node, medium=StorageMedium.CPU)
+            self.kv_events.record_store(
+                node, medium=StorageMedium.CPU, component_type=BASE_COMPONENT_TYPE
+            )
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

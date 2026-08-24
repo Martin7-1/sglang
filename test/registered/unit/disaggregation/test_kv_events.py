@@ -12,8 +12,10 @@ import unittest
 import msgspec
 
 from sglang.srt.disaggregation.kv_events import (
+    BlockRemovedWithComponentType,
     BlockStored,
     BlockStoredMetadata,
+    BlockStoredWithComponentType,
     BlockStoredWithMetadata,
     KVEventBatch,
     StorageMedium,
@@ -138,6 +140,61 @@ class TestBlockStoredWireFormat(CustomTestCase):
             msgspec.msgpack.encode(batch), type=KVEventBatch
         )
         self.assertEqual(round_tripped.events[0].block_hashes, [123])
+
+
+class TestComponentTypeWireFormat(CustomTestCase):
+    """Locks the component-aware wire layout (flag
+    ``--enable-kv-events-component-types``): ``component_type`` sits between
+    ``lora_id`` and ``medium``, matching the internal fork's event layout."""
+
+    def test_block_stored_component_layout(self):
+        event = BlockStoredWithComponentType(
+            block_hashes=[123],
+            parent_block_hash=42,
+            token_ids=[1, 2],
+            block_size=2,
+            lora_id=None,
+            component_type="full",
+            medium=StorageMedium.GPU,
+        )
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(decoded[0], "BlockStored")
+        self.assertEqual(decoded[1], [123])
+        self.assertEqual(decoded[2], 42)
+        self.assertEqual(decoded[3], [1, 2])
+        self.assertEqual(decoded[4], 2)
+        self.assertIsNone(decoded[5])
+        self.assertEqual(decoded[6], "full")
+        self.assertEqual(decoded[7], "GPU")
+        self.assertEqual(len(decoded), 8)
+
+    def test_block_stored_component_round_trip(self):
+        event = BlockStoredWithComponentType(
+            block_hashes=[1],
+            parent_block_hash=None,
+            token_ids=[(10, 20)],
+            block_size=1,
+            lora_id=None,
+            component_type="mamba",
+            medium=None,
+        )
+        round_tripped = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(event), type=BlockStoredWithComponentType
+        )
+        self.assertEqual(round_tripped, event)
+
+    def test_block_removed_component_layout(self):
+        event = BlockRemovedWithComponentType(
+            block_hashes=[100, 200],
+            component_type="swa",
+            medium=StorageMedium.CPU,
+        )
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(decoded[0], "BlockRemoved")
+        self.assertEqual(decoded[1], [100, 200])
+        self.assertEqual(decoded[2], "swa")
+        self.assertEqual(decoded[3], "CPU_PINNED")
+        self.assertEqual(len(decoded), 4)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -32,6 +33,9 @@ class PureSWARadixCache(RadixCache):
     def __init__(self, params: CacheInitParams):
         super().__init__(params)
         self.sliding_window_size = params.sliding_window_size
+        # The only KV this cache materializes is sliding-window attention KV,
+        # so its events declare the SWA component instead of Full.
+        self.kv_events.default_component_type = ComponentType.SWA
 
     def supports_swa(self) -> bool:
         assert (

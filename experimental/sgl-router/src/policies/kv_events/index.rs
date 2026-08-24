@@ -505,6 +505,7 @@ mod tests {
                 token_ids: vec![],
                 block_size: 64,
                 lora_id: None,
+                component_type: None,
                 medium: None,
             })]),
         })
@@ -539,6 +540,7 @@ mod tests {
                 token_ids: vec![],
                 block_size: 64,
                 lora_id: None,
+                component_type: None,
                 medium: None,
             })]),
         })
@@ -551,6 +553,7 @@ mod tests {
             seq: 3,
             batch: batch(vec![KvCacheEvent::BlockRemoved(BlockRemoved {
                 block_hashes: vec![10],
+                component_type: None,
                 medium: None,
             })]),
         })
@@ -586,6 +589,7 @@ mod tests {
                 token_ids: vec![],
                 block_size: 64,
                 lora_id: None,
+                component_type: None,
                 medium: None,
             })]),
         })
@@ -633,6 +637,7 @@ mod tests {
                 token_ids: vec![],
                 block_size: 64,
                 lora_id: None,
+                component_type: None,
                 medium: None,
             })]),
         })
@@ -648,6 +653,7 @@ mod tests {
                 token_ids: vec![],
                 block_size: 64,
                 lora_id: None,
+                component_type: None,
                 medium: None,
             })]),
         })

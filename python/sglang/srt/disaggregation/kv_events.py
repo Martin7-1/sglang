@@ -128,8 +128,42 @@ class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
     metadata: BlockStoredMetadata
 
 
+class BlockStoredWithComponentType(KVCacheEvent, tag="BlockStored"):
+    """BlockStored wire variant carrying the UnifiedRadixCache component.
+
+    Emitted only under ``--enable-kv-events-component-types``. The layout
+    inserts ``component_type`` between ``lora_id`` and ``medium``; legacy
+    consumers must stay on the base struct so their array positions are
+    unchanged when the flag is off.
+    """
+
+    block_hashes: list[int]
+    parent_block_hash: Optional[int]
+    token_ids: list[Union[int, tuple[int, int]]]
+    block_size: int
+    lora_id: Optional[int]
+    component_type: str
+    medium: Optional[str] = None
+
+
+class BlockStoredWithComponentTypeAndMetadata(
+    BlockStoredWithComponentType, tag="BlockStored", kw_only=True
+):
+    """Component-aware BlockStored that also carries typed request metadata."""
+
+    metadata: BlockStoredMetadata
+
+
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: Optional[str] = None
+
+
+class BlockRemovedWithComponentType(KVCacheEvent, tag="BlockRemoved"):
+    """BlockRemoved wire variant carrying the owning component label."""
+
+    block_hashes: list[int]
+    component_type: str
     medium: Optional[str] = None
 
 

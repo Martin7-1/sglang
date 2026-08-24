@@ -18,7 +18,9 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHU
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
+    BlockRemovedWithComponentType,
     BlockStored,
+    BlockStoredWithComponentType,
     StorageMedium,
 )
 from sglang.srt.environ import envs
@@ -48,6 +50,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -7385,6 +7388,155 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
             all(h for h in self._hashes_by_token_ids(cache).values()),
             "every node must carry a hash chain once storage is enabled",
         )
+
+
+class TestUnifiedComponentEventWiring(CustomTestCase):
+    """Component-aware KV event wiring on the unified tree core."""
+
+    def _core(
+        self,
+        component_types,
+        *,
+        flag: bool,
+        has_swa_host_pool: bool = True,
+        enable_hicache: bool = False,
+    ):
+        recorder = KVCacheEventRecorder(
+            enabled=True, page_size=1, component_types_enabled=flag
+        )
+        core = mock.Mock()
+        core.kv_events = recorder
+        core.components = [mock.Mock(component_type=ct) for ct in component_types]
+        core.components_by_type = {
+            ct: comp for ct, comp in zip(component_types, core.components)
+        }
+        core.has_swa_host_pool = has_swa_host_pool
+        core.enable_hicache = enable_hicache
+        core._swa_kv_events_enabled = UnifiedTreeCore._swa_kv_events_enabled.fget(core)
+        core._evict_component_and_detach_lru.return_value = (0, 0)
+        core.evictable_device_leaves = set()
+        core.evictable_host_leaves = set()
+        return core
+
+    def _node(self, component_types=(ComponentType.FULL, ComponentType.MAMBA)):
+        node = UnifiedTreeNode(component_types)
+        node.key = RadixKey(array("q", [0, 1]))
+        node.hash_value = ["aa", "bb"]
+        return node
+
+    def test_release_all_emits_per_component_removals(self):
+        core = self._core((ComponentType.FULL, ComponentType.MAMBA), flag=True)
+        node = self._node()
+        UnifiedTreeCore._release_all_component_layers(
+            core, node, StorageMedium.GPU, defaultdict(int), defaultdict(list),
+            defaultdict(list),
+        )
+        events = core.kv_events.take()
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(isinstance(e, BlockRemovedWithComponentType) for e in events))
+        self.assertEqual(
+            [e.component_type for e in events], ["full", "mamba"]
+        )
+
+    def test_release_all_flag_off_keeps_single_legacy_removal(self):
+        core = self._core((ComponentType.FULL, ComponentType.MAMBA), flag=False)
+        node = self._node()
+        UnifiedTreeCore._release_all_component_layers(
+            core, node, StorageMedium.GPU, defaultdict(int), defaultdict(list),
+            defaultdict(list),
+        )
+        events = core.kv_events.take()
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], BlockRemoved)
+        self.assertNotIsInstance(events[0], BlockRemovedWithComponentType)
+
+    def test_swa_removals_suppressed_on_device_only_hicache(self):
+        # Device-only HiCache keeps SWA as a per-request ring: no SWA events.
+        core = self._core(
+            (ComponentType.FULL, ComponentType.SWA),
+            flag=True,
+            has_swa_host_pool=False,
+            enable_hicache=True,
+        )
+        node = self._node((ComponentType.FULL, ComponentType.SWA))
+        UnifiedTreeCore._release_all_component_layers(
+            core, node, StorageMedium.GPU, defaultdict(int), defaultdict(list),
+            defaultdict(list),
+        )
+        events = core.kv_events.take()
+        self.assertEqual([e.component_type for e in events], ["full"])
+
+        # With a SWA host pool the SWA placement is content-stable: emit.
+        core = self._core(
+            (ComponentType.FULL, ComponentType.SWA),
+            flag=True,
+            has_swa_host_pool=True,
+            enable_hicache=True,
+        )
+        node = self._node((ComponentType.FULL, ComponentType.SWA))
+        UnifiedTreeCore._release_all_component_layers(
+            core, node, StorageMedium.GPU, defaultdict(int), defaultdict(list),
+            defaultdict(list),
+        )
+        events = core.kv_events.take()
+        self.assertEqual([e.component_type for e in events], ["full", "swa"])
+
+    def test_component_store_gated_by_presence_and_swa_stability(self):
+        core = self._core(
+            (ComponentType.FULL, ComponentType.SWA),
+            flag=True,
+            has_swa_host_pool=False,
+            enable_hicache=True,
+        )
+        node = self._node((ComponentType.FULL, ComponentType.SWA))
+        node.component_data[ComponentType.FULL].value = torch.tensor(
+            [1], dtype=torch.int64
+        )
+        node.component_data[ComponentType.SWA].value = torch.tensor(
+            [2], dtype=torch.int64
+        )
+
+        UnifiedTreeCore._record_component_store_if_present(
+            core, node, StorageMedium.GPU, ComponentType.FULL
+        )
+        # SWA is not content-stable here: suppressed despite being present.
+        UnifiedTreeCore._record_component_store_if_present(
+            core, node, StorageMedium.GPU, ComponentType.SWA
+        )
+        events = core.kv_events.take()
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], BlockStoredWithComponentType)
+        self.assertEqual(events[0].component_type, "full")
+
+        # No device value -> no event.
+        node.component_data[ComponentType.FULL].value = None
+        UnifiedTreeCore._record_component_store_if_present(
+            core, node, StorageMedium.GPU, ComponentType.FULL
+        )
+        self.assertEqual(core.kv_events.take(), [])
+
+    def test_unified_cache_flag_reaches_tree_core_recorder(self):
+        params = CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=2,
+                max_context_len=8,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=True,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: _FakeFullComponent},
+            enable_kv_cache_events=True,
+            enable_kv_cache_event_component_types=True,
+        )
+        cache = UnifiedRadixCache(params=params)
+        self.assertTrue(cache.tree_core.kv_events.component_types_enabled)
+
+        params = replace(params, enable_kv_cache_event_component_types=False)
+        cache = UnifiedRadixCache(params=params)
+        self.assertFalse(cache.tree_core.kv_events.component_types_enabled)
 
 
 if __name__ == "__main__":

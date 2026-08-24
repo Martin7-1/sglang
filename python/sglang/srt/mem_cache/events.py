@@ -23,11 +23,15 @@ from typing import Any, Optional
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
+    BlockRemovedWithComponentType,
     BlockStored,
     BlockStoredMetadata,
+    BlockStoredWithComponentType,
+    BlockStoredWithComponentTypeAndMetadata,
     BlockStoredWithMetadata,
     StorageMedium,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
@@ -42,9 +46,18 @@ class KVCacheEventRecorder:
     empty list, so callers never have to guard.
     """
 
-    def __init__(self, *, enabled: bool, page_size: int):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        page_size: int,
+        component_types_enabled: bool = False,
+        default_component_type: Optional[ComponentType] = None,
+    ):
         self.enabled = enabled
         self.page_size = page_size
+        self.component_types_enabled = component_types_enabled
+        self.default_component_type = default_component_type
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -57,7 +70,43 @@ class KVCacheEventRecorder:
         if self._queue:
             tail = self._queue[-1]
 
-            if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
+            if isinstance(tail, BlockRemovedWithComponentType) and isinstance(
+                event, BlockRemovedWithComponentType
+            ):
+                if (
+                    tail.medium == event.medium
+                    and tail.component_type == event.component_type
+                ):
+                    tail.block_hashes.extend(event.block_hashes)
+                    return
+
+            elif isinstance(tail, BlockStoredWithComponentType) and isinstance(
+                event, BlockStoredWithComponentType
+            ):
+                tail_metadata = (
+                    tail.metadata
+                    if isinstance(tail, BlockStoredWithComponentTypeAndMetadata)
+                    else None
+                )
+                event_metadata = (
+                    event.metadata
+                    if isinstance(event, BlockStoredWithComponentTypeAndMetadata)
+                    else None
+                )
+                if (
+                    tail.medium == event.medium
+                    and tail.lora_id == event.lora_id
+                    and tail.block_size == event.block_size
+                    and tail.component_type == event.component_type
+                    and tail_metadata == event_metadata
+                    and tail.block_hashes
+                    and event.parent_block_hash == tail.block_hashes[-1]
+                ):
+                    tail.block_hashes.extend(event.block_hashes)
+                    tail.token_ids.extend(event.token_ids)
+                    return
+
+            elif isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
                 if tail.medium == event.medium:
                     tail.block_hashes.extend(event.block_hashes)
                     return
@@ -112,7 +161,51 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def record_store(self, node: Any, medium=None) -> None:
+    def _resolve_component_type(
+        self, component_type: Optional[ComponentType]
+    ) -> Optional[ComponentType]:
+        """Component to publish for this recording, or ``None`` for legacy."""
+        if not self.component_types_enabled:
+            return None
+        if component_type is None:
+            component_type = self.default_component_type
+        return component_type
+
+    def _make_component_store_event(
+        self,
+        node: Any,
+        *,
+        block_hashes: list,
+        parent_block_hash: Optional[int],
+        token_ids: list,
+        block_size: int,
+        medium,
+        component_type: str,
+    ):
+        event_args = {
+            "block_hashes": block_hashes,
+            "parent_block_hash": parent_block_hash,
+            "token_ids": token_ids,
+            "block_size": block_size,
+            "lora_id": None,
+            "component_type": component_type,
+            "medium": medium,
+        }
+        if node.key.cache_salt is None:
+            return BlockStoredWithComponentType(**event_args)
+        return BlockStoredWithComponentTypeAndMetadata(
+            **event_args,
+            metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
+        )
+
+    def _page_tokens(self, node: Any, start: int, end: int) -> list:
+        raw = node.key.token_ids
+        # Preserve historical event payload: bigram pages expose tuples.
+        if node.key.is_bigram:
+            return [(raw[j], raw[j + 1]) for j in range(start, end)]
+        return list(raw[start:end])
+
+    def record_store(self, node: Any, medium=None, component_type=None) -> None:
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
         # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
@@ -120,6 +213,11 @@ class KVCacheEventRecorder:
             return
         if medium is None:
             medium = StorageMedium.GPU
+
+        resolved_component = self._resolve_component_type(component_type)
+        if resolved_component is not None:
+            self._record_store_component(node, medium, resolved_component)
+            return
 
         event_hash_values = self._node_event_hash_values(node)
         parent_block_hash = self._parent_block_hash(node)
@@ -160,7 +258,52 @@ class KVCacheEventRecorder:
             parent_block_hash = block_hash
             page_index += 1
 
-    def record_remove(self, node: Any, medium=None) -> None:
+    def _record_store_component(self, node: Any, medium, component_type) -> None:
+        """Record a Full/SWA page chain or a Mamba leaf checkpoint after commit."""
+        event_hash_values = self._node_event_hash_values(node)
+        label = str(component_type)
+
+        if component_type.is_mamba:
+            # The checkpoint anchors to the node's last page hash; report
+            # exactly that page's tokens so hash and token range stay aligned.
+            logical_len = len(node.key)
+            start = max(0, logical_len - self.page_size)
+            self.enqueue(
+                self._make_component_store_event(
+                    node,
+                    block_hashes=[hash_str_to_int64(event_hash_values[-1])],
+                    parent_block_hash=None,
+                    token_ids=self._page_tokens(node, start, logical_len),
+                    block_size=logical_len - start,
+                    medium=medium,
+                    component_type=label,
+                )
+            )
+            return
+
+        parent_block_hash = self._parent_block_hash(node)
+        page_index = 0
+        logical_len = len(node.key)
+        for start in range(0, logical_len, self.page_size):
+            end = min(start + self.page_size, logical_len)
+            if end <= start:
+                continue
+            block_hash = hash_str_to_int64(event_hash_values[page_index])
+            self.enqueue(
+                self._make_component_store_event(
+                    node,
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=self._page_tokens(node, start, end),
+                    block_size=end - start,
+                    medium=medium,
+                    component_type=label,
+                )
+            )
+            parent_block_hash = block_hash
+            page_index += 1
+
+    def record_remove(self, node: Any, medium=None, component_type=None) -> None:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
@@ -168,6 +311,11 @@ class KVCacheEventRecorder:
             return
         if medium is None:
             medium = StorageMedium.GPU
+
+        resolved_component = self._resolve_component_type(component_type)
+        if resolved_component is not None:
+            self._record_remove_component(node, medium, resolved_component)
+            return
 
         # Hash values must match what was stored.
         event_hash_values = self._node_event_hash_values(node)
@@ -185,6 +333,40 @@ class KVCacheEventRecorder:
 
         if block_hashes:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+
+    def _record_remove_component(self, node: Any, medium, component_type) -> None:
+        """Record a component removal after the allocator has freed it."""
+        event_hash_values = self._node_event_hash_values(node)
+        label = str(component_type)
+
+        if component_type.is_mamba:
+            self.enqueue(
+                BlockRemovedWithComponentType(
+                    block_hashes=[hash_str_to_int64(event_hash_values[-1])],
+                    component_type=label,
+                    medium=medium,
+                )
+            )
+            return
+
+        block_hashes = []
+        logical_len = len(node.key)
+        page_index = 0
+        for start in range(0, logical_len, self.page_size):
+            end = min(start + self.page_size, logical_len)
+            if end <= start:
+                continue
+            block_hashes.append(hash_str_to_int64(event_hash_values[page_index]))
+            page_index += 1
+
+        if block_hashes:
+            self.enqueue(
+                BlockRemovedWithComponentType(
+                    block_hashes=block_hashes,
+                    component_type=label,
+                    medium=medium,
+                )
+            )
 
     def record_all_cleared(self) -> None:
         if not self.enabled:

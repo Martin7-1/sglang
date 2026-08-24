@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
@@ -351,7 +352,10 @@ class SWARadixCache(BasePrefixCache):
         self.disable = params.disable
         self.is_eagle = params.is_eagle
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            component_types_enabled=params.enable_kv_cache_event_component_types,
+            default_component_type=ComponentType.FULL,
         )
 
         if self.token_to_kv_pool_allocator:

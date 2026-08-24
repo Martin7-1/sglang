@@ -72,6 +72,10 @@ pub struct BlockStored {
     pub block_size: u32,
     /// LoRA adapter ID this block is associated with, if any.
     pub lora_id: Option<i64>,
+    /// Cache component identity (`"full"`, `"swa"`, `"mamba"`), present only
+    /// in the 8-element layout emitted under `--enable-kv-events-component-types`.
+    /// `None` for the legacy 6/7-element layout.
+    pub component_type: Option<String>,
     /// Storage tier (`"GPU"`, `"CPU_PINNED"`, `"DISK"`, `"EXTERNAL"`).
     /// Optional in the Python schema (`= None` default), so it may be
     /// omitted entirely under `omit_defaults`.
@@ -81,6 +85,9 @@ pub struct BlockStored {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockRemoved {
     pub block_hashes: Vec<i64>,
+    /// Cache component identity; see [`BlockStored::component_type`]. Present
+    /// only in the 4-element component layout.
+    pub component_type: Option<String>,
     /// Same semantics as [`BlockStored::medium`].
     pub medium: Option<String>,
 }
@@ -394,6 +401,12 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
             where
                 A: SeqAccess<'de>,
             {
+                // Total element count (tag included) drives the layout
+                // disambiguation below: the component-aware variants insert
+                // `component_type` before `medium`, shifting it positionally,
+                // so the two layouts are distinguished purely by length
+                // (BlockStored 8 vs 6/7, BlockRemoved 4 vs 2/3).
+                let total_len = seq.size_hint();
                 let tag: String = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::missing_field("event tag"))?;
@@ -413,8 +426,23 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         // `lora_id` is `Optional[int]` with no default — it's
                         // always emitted, but as nil when absent.
                         let lora_id: Option<i64> = seq.next_element()?.unwrap_or(None);
-                        // `medium` defaults to None and may be omitted.
-                        let medium: Option<String> = seq.next_element()?.unwrap_or(None);
+                        let (component_type, medium) =
+                            if total_len.map(|t| t >= 8).unwrap_or(false) {
+                                // Component layout: `component_type` (always a
+                                // string) then `medium`.
+                                let component_type: Option<String> =
+                                    seq.next_element()?.unwrap_or(None);
+                                let medium: Option<String> =
+                                    seq.next_element()?.unwrap_or(None);
+                                (component_type, medium)
+                            } else {
+                                // Legacy layout: `medium` directly after
+                                // `lora_id`; defaults to None and may be
+                                // omitted.
+                                let medium: Option<String> =
+                                    seq.next_element()?.unwrap_or(None);
+                                (None, medium)
+                            };
                         while seq.next_element::<IgnoredAny>()?.is_some() {}
                         Ok(KvCacheEvent::BlockStored(BlockStored {
                             block_hashes: block_hashes.0,
@@ -422,6 +450,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                             token_ids: token_ids.0,
                             block_size,
                             lora_id,
+                            component_type,
                             medium,
                         }))
                     }
@@ -429,10 +458,22 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         let block_hashes: BoundedI64Vec = seq
                             .next_element()?
                             .ok_or_else(|| de::Error::missing_field("block_hashes"))?;
-                        let medium: Option<String> = seq.next_element()?.unwrap_or(None);
+                        let (component_type, medium) =
+                            if total_len.map(|t| t >= 4).unwrap_or(false) {
+                                let component_type: Option<String> =
+                                    seq.next_element()?.unwrap_or(None);
+                                let medium: Option<String> =
+                                    seq.next_element()?.unwrap_or(None);
+                                (component_type, medium)
+                            } else {
+                                let medium: Option<String> =
+                                    seq.next_element()?.unwrap_or(None);
+                                (None, medium)
+                            };
                         while seq.next_element::<IgnoredAny>()?.is_some() {}
                         Ok(KvCacheEvent::BlockRemoved(BlockRemoved {
                             block_hashes: block_hashes.0,
+                            component_type,
                             medium,
                         }))
                     }
@@ -684,6 +725,139 @@ mod tests {
                 assert_eq!(b.block_size, 16);
             }
             other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    /// Build a component-aware BlockStored as the flag
+    /// `--enable-kv-events-component-types` emits it: 8 elements —
+    /// `[tag, block_hashes, parent, token_ids, block_size, lora_id,
+    /// component_type, medium]`.
+    fn build_block_stored_component_bytes(
+        block_hashes: &[i64],
+        parent: Option<i64>,
+        token_ids: &[u32],
+        block_size: u32,
+        lora_id: Option<i64>,
+        component_type: &str,
+        medium: Option<&str>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_event_array(&mut buf, "BlockStored", 8);
+        write_i64_array(&mut buf, block_hashes);
+        match parent {
+            Some(v) => {
+                mp::write_sint(&mut buf, v).unwrap();
+            }
+            None => mp::write_nil(&mut buf).unwrap(),
+        }
+        write_u32_array(&mut buf, token_ids);
+        mp::write_uint(&mut buf, block_size as u64).unwrap();
+        match lora_id {
+            Some(v) => {
+                mp::write_sint(&mut buf, v).unwrap();
+            }
+            None => mp::write_nil(&mut buf).unwrap(),
+        }
+        mp::write_str(&mut buf, component_type).unwrap();
+        match medium {
+            Some(s) => mp::write_str(&mut buf, s).unwrap(),
+            None => mp::write_nil(&mut buf).unwrap(),
+        }
+        buf
+    }
+
+    /// Build a component-aware BlockRemoved: 4 elements —
+    /// `[tag, block_hashes, component_type, medium]`.
+    fn build_block_removed_component_bytes(
+        block_hashes: &[i64],
+        component_type: &str,
+        medium: Option<&str>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_event_array(&mut buf, "BlockRemoved", 4);
+        write_i64_array(&mut buf, block_hashes);
+        mp::write_str(&mut buf, component_type).unwrap();
+        match medium {
+            Some(s) => mp::write_str(&mut buf, s).unwrap(),
+            None => mp::write_nil(&mut buf).unwrap(),
+        }
+        buf
+    }
+
+    #[test]
+    fn decodes_component_block_stored_full_layout() {
+        let event = build_block_stored_component_bytes(
+            &[11, 12],
+            Some(7),
+            &[1, 2, 3, 4],
+            4,
+            None,
+            "full",
+            Some("GPU"),
+        );
+        let bytes = build_batch_bytes(3.0, &[event], Some(0), true);
+
+        let batch = decode_event_batch(&bytes).expect("decode component BlockStored");
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.block_hashes, vec![11, 12]);
+                assert_eq!(b.parent_block_hash, Some(7));
+                assert_eq!(b.token_ids, vec![1, 2, 3, 4]);
+                assert_eq!(b.block_size, 4);
+                assert_eq!(b.lora_id, None);
+                assert_eq!(b.component_type.as_deref(), Some("full"));
+                assert_eq!(b.medium.as_deref(), Some("GPU"));
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_component_block_stored_mamba_leaf_nil_medium() {
+        let event = build_block_stored_component_bytes(&[99], None, &[4, 5], 2, None, "mamba", None);
+        let bytes = build_batch_bytes(4.0, &[event], None, true);
+
+        let batch = decode_event_batch(&bytes).expect("decode mamba leaf event");
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.component_type.as_deref(), Some("mamba"));
+                assert_eq!(b.medium, None);
+                assert_eq!(b.parent_block_hash, None);
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_component_block_removed() {
+        let event = build_block_removed_component_bytes(&[100], "swa", Some("DISK"));
+        let bytes = build_batch_bytes(5.0, &[event], Some(1), true);
+
+        let batch = decode_event_batch(&bytes).expect("decode component BlockRemoved");
+        match &batch.events[0] {
+            KvCacheEvent::BlockRemoved(r) => {
+                assert_eq!(r.block_hashes, vec![100]);
+                assert_eq!(r.component_type.as_deref(), Some("swa"));
+                assert_eq!(r.medium.as_deref(), Some("DISK"));
+            }
+            other => panic!("expected BlockRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_block_stored_decodes_with_no_component() {
+        // Regression guard: the 7-element legacy layout must keep decoding
+        // with component_type=None even after the component layout exists.
+        let event = build_block_stored_bytes(&[5], None, &[1], 1, None, Some("GPU"));
+        let bytes = build_batch_bytes(6.0, &[event], None, true);
+
+        let batch = decode_event_batch(&bytes).expect("decode legacy layout");
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.component_type, None);
+                assert_eq!(b.medium.as_deref(), Some("GPU"));
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
         }
     }
 

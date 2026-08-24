@@ -578,20 +578,24 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
 
     match event_type {
         "BlockStored" => {
-            // At least 7 fields (the legacy schema); an 8th `component_types`
-            // slot appears with `--enable-kv-events-component-types`. Both
-            // shapes are accepted.
+            // At least 7 fields (the legacy schema); the component layout
+            // emitted with `--enable-kv-events-component-types` has 8 fields
+            // and inserts `component_type` between `lora_id` and `medium`,
+            // shifting `medium` to slot 7. Both shapes are accepted.
             if event.len() < 7 {
                 return Err(BridgeError::Decode(
                     "BlockStored must have at least 7 array fields".to_string(),
                 ));
             }
-            let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            // `component_types` is the trailing slot: a list of component labels
-            // folded into a bitmask, or nil/absent for a legacy whole-block store.
-            let mask = match event.get(7) {
-                Some(value) => decode_component_mask(value)?,
-                None => None,
+            let (mask, tier) = if event.len() >= 8 {
+                let mask = decode_component_mask(&event[6])?;
+                let tier =
+                    medium_to_tier(expect_optional_str(&event[7], "BlockStored.medium")?)?;
+                (mask, tier)
+            } else {
+                let tier =
+                    medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
+                (None, tier)
             };
             // The token count is only carried alongside component-aware stores,
             // where the query path needs it to accumulate trailing windows.
@@ -607,7 +611,14 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
                     "BlockRemoved must have 3 array fields".to_string(),
                 ));
             }
-            let tier = medium_to_tier(expect_optional_str(&event[2], "BlockRemoved.medium")?)?;
+            // Component layout (4 fields) inserts `component_type` at slot 2
+            // and shifts `medium` to slot 3. Revocation is hash-based, so the
+            // label does not change the revoke action; the tier does.
+            let medium_slot = if event.len() >= 4 { 3 } else { 2 };
+            let tier = medium_to_tier(expect_optional_str(
+                &event[medium_slot],
+                "BlockRemoved.medium",
+            )?)?;
             actions.revoke(tier, decode_hashes(&event[1])?);
         }
         "AllBlocksCleared" => {
@@ -643,23 +654,19 @@ fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
         .collect()
 }
 
-/// Decodes the optional `component_types` slot of a `BlockStored` into a component
-/// bitmask. `nil` maps to `None`, a legacy whole-block store; an array of labels
-/// folds into a bitmask, and labels this build does not model are ignored.
+/// Decodes the `component_type` slot of a component-layout `BlockStored`
+/// into a component bitmask. Each event carries exactly one component label
+/// (`"full"`, `"swa"`, `"mamba"`); labels this build does not model fold
+/// into a zero mask, which still marks the store as component-aware. `nil`
+/// maps to `None`, a legacy whole-block store.
 fn decode_component_mask(value: &Value) -> Result<Option<u32>, BridgeError> {
     if matches!(value, Value::Nil) {
         return Ok(None);
     }
-    let mut mask = 0u32;
-    for item in expect_array(value, "BlockStored.component_types")? {
-        let name = item
-            .as_str()
-            .ok_or_else(|| BridgeError::Decode("component type must be a string".to_string()))?;
-        if let Some(bit) = component_bit(name) {
-            mask |= bit;
-        }
-    }
-    Ok(Some(mask))
+    let name = value
+        .as_str()
+        .ok_or_else(|| BridgeError::Decode("component type must be a string".to_string()))?;
+    Ok(Some(component_bit(name).unwrap_or(0)))
 }
 
 /// Decodes the `block_size` (token count) slot of a `BlockStored`.
@@ -847,9 +854,10 @@ mod tests {
         ])
     }
 
-    /// A component-aware `BlockStored` (8-element schema): trailing
-    /// `component_types` slot plus a concrete `block_size` token count.
-    fn stored_c(hashes: &[i64], medium: &str, block_size: i64, components: Value) -> Value {
+    /// A component-aware `BlockStored` (8-element schema): `component_type`
+    /// sits at slot 6 between `lora_id` and `medium` (slot 7), emitted under
+    /// `--enable-kv-events-component-types`.
+    fn stored_c(hashes: &[i64], medium: &str, block_size: i64, component_type: &str) -> Value {
         Value::Array(vec![
             Value::String("BlockStored".into()),
             ints(hashes),
@@ -857,13 +865,20 @@ mod tests {
             ints(&[1]), // token_ids
             Value::from(block_size),
             Value::Nil, // lora_id
+            Value::String(component_type.into()),
             Value::String(medium.into()),
-            components, // component_types (Nil or array of strings)
         ])
     }
 
-    fn strv(items: &[&str]) -> Value {
-        Value::Array(items.iter().map(|s| Value::String((*s).into())).collect())
+    /// A component-aware `BlockRemoved` (4-element schema): `component_type`
+    /// at slot 2, `medium` shifted to slot 3.
+    fn removed_c(hashes: &[i64], component_type: &str, medium: &str) -> Value {
+        Value::Array(vec![
+            Value::String("BlockRemoved".into()),
+            ints(hashes),
+            Value::String(component_type.into()),
+            Value::String(medium.into()),
+        ])
     }
 
     /// Legacy (whole-block) report action expectation.
@@ -1347,27 +1362,39 @@ mod tests {
     // --- component-aware decoding ---
 
     #[test]
-    fn component_types_list_decodes_into_report() {
+    fn component_type_label_decodes_into_report() {
         assert_eq!(
-            actions_of(vec![stored_c(&[1], "GPU", 64, strv(&["full", "swa"]))]),
+            actions_of(vec![stored_c(&[1], "GPU", 64, "swa")]),
             vec![Action::Report {
                 tier: hbm(),
                 hashes: vec![1],
-                masks: vec![Some(
-                    crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
-                )],
+                masks: vec![Some(crate::service::COMPONENT_SWA)],
                 block_sizes: vec![Some(64)],
+            }]
+        );
+        assert_eq!(
+            actions_of(vec![stored_c(&[2], "CPU_PINNED", 16, "mamba")]),
+            vec![Action::Report {
+                tier: dram(),
+                hashes: vec![2],
+                masks: vec![Some(crate::service::COMPONENT_MAMBA)],
+                block_sizes: vec![Some(16)],
             }]
         );
     }
 
     #[test]
-    fn component_types_nil_decodes_as_legacy() {
-        // An 8-element BlockStored whose trailing slot is nil is exactly the
-        // legacy whole-block store: no components, no size.
+    fn unknown_component_label_keeps_component_aware_report() {
+        // Labels this build does not model fold into a zero mask but still
+        // mark the store as component-aware (block size carried).
         assert_eq!(
-            actions_of(vec![stored_c(&[1], "GPU", 64, Value::Nil)]),
-            vec![rep(hbm(), &["1"])]
+            actions_of(vec![stored_c(&[1], "GPU", 64, "c128")]),
+            vec![Action::Report {
+                tier: hbm(),
+                hashes: vec![1],
+                masks: vec![Some(0)],
+                block_sizes: vec![Some(64)],
+            }]
         );
     }
 
@@ -1378,8 +1405,8 @@ mod tests {
             &config,
             0,
             vec![
-                stored_c(&[1], "GPU", 64, strv(&["full", "swa"])),
-                stored_c(&[2], "GPU", 32, strv(&["full"])),
+                stored_c(&[1], "GPU", 64, "swa"),
+                stored_c(&[2], "GPU", 32, "full"),
             ],
         );
         assert_eq!(request.actions.len(), 1);
@@ -1387,12 +1414,24 @@ mod tests {
         assert_eq!(action.hashes, vec![1, 2]);
         assert_eq!(
             action.component_masks,
-            vec![
-                crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA,
-                crate::service::COMPONENT_FULL,
-            ]
+            vec![crate::service::COMPONENT_SWA, crate::service::COMPONENT_FULL]
         );
         assert_eq!(action.block_sizes, vec![64, 32]);
+    }
+
+    #[test]
+    fn component_block_removed_reads_shifted_medium_slot() {
+        // The component layout shifts `medium` to slot 3; the revoke must
+        // land on that tier, not on the slot-2 `component_type` string.
+        assert_eq!(
+            actions_of(vec![removed_c(&[9], "swa", "DISK")]),
+            vec![rev(ssd(), &["9"])]
+        );
+        // Legacy 3-field removal keeps decoding.
+        assert_eq!(
+            actions_of(vec![removed(&[9], "DISK")]),
+            vec![rev(ssd(), &["9"])]
+        );
     }
 
     #[test]

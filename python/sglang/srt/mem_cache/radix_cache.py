@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -311,7 +312,10 @@ class RadixCache(BasePrefixCache):
         self.eviction_policy = params.eviction_policy.lower()
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            component_types_enabled=params.enable_kv_cache_event_component_types,
+            default_component_type=ComponentType.FULL,
         )
 
         if params.enable_metrics:

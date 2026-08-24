@@ -1671,6 +1671,14 @@ class ServerArgs:
         "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         NS("observability"),
     ] = None
+    enable_kv_events_component_types: A[
+        bool,
+        "Publish the cache component identity (full/swa/mamba) on KV cache events. "
+        "Extends BlockStored/BlockRemoved with a component_type field between "
+        "lora_id and medium; positional consumers of the legacy layout must stay "
+        "on the default (off).",
+        NS("observability"),
+    ] = False
     enable_forward_pass_metrics: A[
         bool,
         "Enable per-iteration forward pass metrics via ZMQ IPC. External consumers (e.g. Dynamo planner) subscribe to the IPC endpoint exposed in server_args.forward_pass_metrics_ipc_name.",
